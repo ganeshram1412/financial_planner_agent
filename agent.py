@@ -6,7 +6,7 @@ import asyncio # Imported, although the LLM handles the parallel execution
 from google.genai import types
 from google.adk.agents import LlmAgent
 from google.adk.models.google_llm import Gemini
-from google.adk.tools import google_search
+from google.adk.tools import google_search,AgentTool
 
 # --- 1. Sub-Agent Imports ---
 # NOTE: Ensure these module names and variable names match your sub-agent files!
@@ -55,10 +55,10 @@ google_search_agent = LlmAgent(
 # --- 4. The Root Orchestrator Instruction (Optimized for Cost) ---
 
 financial_planner_agent_instruction = """
-You are Aura, a warm, non-judgmental SEBI-certified Financial Planner orchestrator.
+You are Aura, a warm, non-judgmental Chartered Accountant Financial Planner orchestrator.
 Your role: guide the client through a structured workflow, delegate tasks to sub-agents,
 and synthesize a final actionable plan. Maintain a friendly, encouraging tone.
-Include a disclaimer that AI-generated content may be inaccurate.
+Include a disclaimer that AI-generated content may be inaccurate just once at beginning.
 
 ORCHESTRATION WORKFLOW (Follow Exactly in Order):
 
@@ -78,14 +78,14 @@ ORCHESTRATION WORKFLOW (Follow Exactly in Order):
 3. Goal Setting & Projections
    - Ask the client for their primary goal.
    - Delegate to:
-        * `smart_goal_agent` – SMART goal creation
-        * `scenario_modeling_agent` – projections using SMART goal + risk profile
+        * `smart_goal_agent`-SMART goal creation
+        * `scenario_modeling_agent`-projections using SMART goal + risk profile
 
 4. Strategy Synthesis
    - If high-interest debt exists, delegate to:
         * `debt_management_agent`
    - Send ALL outputs (Data, Risk, Budget, Tax, Goal, Scenario, Debt if any) to:
-        * `summarizer_agent` – produce the consolidated financial plan.
+        * `summarizer_agent`-produce the consolidated financial plan.
 
 5. Closure
    - Share the final summarized plan.
@@ -103,7 +103,7 @@ root_agent = LlmAgent(
     model=Gemini(model="gemini-2.5-flash", retry_options=retry_config),
     description="The main orchestrator for comprehensive, empathetic financial planning.",
     instruction=financial_planner_agent_instruction,
-    tools=[financial_data_collector_agent_tool,summarizer_agent_tool,smart_goal_agent_tool,risk_assessment_agent_tool,scenario_modeling_agent_tool,tax_implication_agent_tool,debt_management_agent_tool,budget_optimizer_agent_tool,google_search_agent]
+    tools=[AgentTool(financial_data_collector_agent_tool),AgentTool(summarizer_agent_tool),AgentTool(smart_goal_agent_tool),AgentTool(risk_assessment_agent_tool),AgentTool(scenario_modeling_agent_tool),AgentTool(tax_implication_agent_tool),AgentTool(debt_management_agent_tool),AgentTool(budget_optimizer_agent_tool),AgentTool(google_search_agent)]
 )
 
 logger.info("Financial Planner Orchestrator Agent (root_agent) fully defined.")
