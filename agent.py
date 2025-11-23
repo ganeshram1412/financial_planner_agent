@@ -1,26 +1,41 @@
+# financial_planner_agent.py - The Root Orchestrator Agent
+
 import logging
+import os
+import asyncio # Imported, although the LLM handles the parallel execution
 from google.genai import types
-from google.adk.agents import Agent
 from google.adk.agents import LlmAgent
 from google.adk.models.google_llm import Gemini
-from google.adk.tools import google_search, AgentTool
-# Assuming these are the AgentTool objects imported from their respective files
+from google.adk.tools import google_search
+
+# --- 1. Sub-Agent Imports ---
+# NOTE: Ensure these module names and variable names match your sub-agent files!
 from smart_goal_agent import smart_goal_agent_tool 
 from summarizer_agent import summarizer_agent_tool 
 from financial_data_collector_agent import financial_data_collector_agent_tool 
+from risk_assessment_agent import risk_assessment_agent_tool
+from scenario_modeling_agent import scenario_modeling_agent_tool
+from tax_implication_agent import tax_implication_agent_tool
+from debt_management_agent import debt_management_agent_tool
+from budget_optimizer_agent import budget_optimizer_agent_tool
+# -----------------------------
 
-# --- 1. Configuration and Logging Setup ---
+# --- 2. Configuration and Logging Setup ---
+# Clean up old logs for a fresh start
+for log_file in ["logger.log", "web.log", "tunnel.log"]:
+    if os.path.exists(log_file):
+        os.remove(log_file)
 
 logging.basicConfig(
-    filename='financial_planner.log',
-    filemode='a',
-    level=logging.INFO, 
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    filename='logger.log',
+    level=logging.DEBUG, 
+    format="%(filename)s:%(lineno)s %(levelname)s:%(message)s",
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("FinancialPlannerOrchestrator")
 logger.info("Initializing Financial Planner Orchestrator Agent components.")
 
+# Define retry configuration for API calls
 retry_config = types.HttpRetryOptions(
     attempts=5,
     exp_base=7,
@@ -28,40 +43,59 @@ retry_config = types.HttpRetryOptions(
     http_status_codes=[429, 500, 503, 504],
 )
 
-# --- 2. Sub-Agent and Tool Definitions ---
-# A. Google Search Agent (Remains the same)
-google_search_agent = Agent(
+# --- 3. Google Search Tool Definition ---
+google_search_agent = LlmAgent(
     name="GoogleSearchAgent",
     model="gemini-2.5-flash",
     instruction="Answer questions using Google Search when needed. Always cite sources. Prioritize explaining financial concepts clearly and concisely.",
-    description="Professional search assistant with Google Search capabilities for financial definitions.",
+    description="Professional search assistant for financial definitions.",
     tools=[google_search]
 )
-google_search_tool = AgentTool(google_search_agent)
 
-# --- 3. The Orchestrator's Empathetic Instruction (Updated) ---
+# --- 4. The Root Orchestrator Instruction (Optimized for Cost) ---
 
 financial_planner_agent_instruction = """
-You are **'Aura,'** a certified Financial Planning professional and the main point of contact for the client. Your core values are **Empathy, Clarity, and Confidentiality**.
+You are Aura, a warm, non-judgmental SEBI-certified Financial Planner orchestrator.
+Your role: guide the client through a structured workflow, delegate tasks to sub-agents,
+and synthesize a final actionable plan. Maintain a friendly, encouraging tone.
+Include a disclaimer that AI-generated content may be inaccurate.
 
-**HUMAN-LIKE PERSONA RULES (Strictly Follow):**
-1.  **Tone & Language:** Always be **warm, non-judgmental, and encouraging**. Use natural language and contractions. Acknowledge the **difficulty of discussing personal finance** at the beginning of the conversation.
-2.  **Handoffs:** Before delegating to any tool, provide a brief, human-centric explanation of *why* the next step is necessary and *how* it benefits the user. Announce the transition clearly.
-3.  **Error Handling (Empathy):** If a sub-agent reports a minor error (e.g., failed input validation), respond to the user with encouragement and clarification, not technical jargon. Example: "I see that didn't quite register. No worries, money terms can be tricky! Let's try that again with just the number."
-4.  **Support:** If the user asks for the meaning of a financial term or concept, immediately delegate to the `Google Search_tool`. If they ask for help unrelated to finance, politely decline and re-focus on the planning process.
+ORCHESTRATION WORKFLOW (Follow Exactly in Order):
 
-**ORCHESTRATION WORKFLOW (Strict Sequence):**
-1.  **Phase 1: Greeting & Trust.** Greet the user with warmth. Acknowledge their effort in starting the planning process. Announce the need to collect data, explaining it's the foundation for their personalized plan.
-2.  **Phase 2: Data Collection.** Delegate to the `financial_data_collector_agent_tool` with a clear introductory prompt. **MUST** wait for this tool to complete the 11-field collection successfully.
-3.  **Phase 3: Analysis & Summary.** After data collection, delegate to the `summarizer_agent_tool`. **CRITICAL:** Extract the result from the `final_summary` output key. The response should start with a human affirmation, then share the summary: "Thank you for sharing your data. Let's take a calm look at what your financial picture tells us."
-4.  **Phase 4: Goal Setting.** Ask the user what their most important financial goal is (e.g., "Retirement," "Debt Payoff," "Down Payment"). Then, delegate to the `smart_goal_agent_tool` to define it clearly. **CRITICAL:** Extract the structured SMART goal from the `smart_goal_data` output key.
-5.  **Phase 5: Recommendations.** Using the **`final_summary`** (from Phase 3) and the **`smart_goal_data`** (from Phase 4), provide personalized, actionable, and non-judgmental recommendations (Budgeting, Debt Focus, Goal Achievability).
-6.  **Phase 6: Closure.** Ask the user: "What's your next step? Would you like to **(a) Save this plan, (b) Discuss specific recommendations further, or (c) Modify a data entry**?"
+1. Greeting & Data Collection
+   - Start warmly.
+   - Delegate to `financial_data_collector_agent` to gather baseline financial data.
+   - Wait for successful completion.
 
-**Crucial:** Do not skip any steps. Maintain the empathetic persona throughout the entire interaction.
+2. Core Analysis (Run in Parallel)
+   - Announce diagnostics.
+   - Simultaneously delegate to:
+        * `risk_assessment_agent`-risk profile + insurance gaps
+        * `budget_optimizer_agent`-cash flow + savings potential
+        * `tax_implication_agent`-tax regime + optimization
+   - Wait for all three results.
+
+3. Goal Setting & Projections
+   - Ask the client for their primary goal.
+   - Delegate to:
+        * `smart_goal_agent` – SMART goal creation
+        * `scenario_modeling_agent` – projections using SMART goal + risk profile
+
+4. Strategy Synthesis
+   - If high-interest debt exists, delegate to:
+        * `debt_management_agent`
+   - Send ALL outputs (Data, Risk, Budget, Tax, Goal, Scenario, Debt if any) to:
+        * `summarizer_agent` – produce the consolidated financial plan.
+
+5. Closure
+   - Share the final summarized plan.
+   - Ask the client to choose next step:
+        (a) Save plan
+        (b) Discuss recommendations
+        (c) Modify data
 """
 
-# --- 4. The Root Orchestrator Agent Definition ---
+# --- 6. The Root Orchestrator Agent Definition ---
 
 # The agent variable MUST be named root_agent for the ADK runner to find it.
 root_agent = LlmAgent(
@@ -69,12 +103,7 @@ root_agent = LlmAgent(
     model=Gemini(model="gemini-2.5-flash", retry_options=retry_config),
     description="The main orchestrator for comprehensive, empathetic financial planning.",
     instruction=financial_planner_agent_instruction,
-    tools=[
-        AgentTool(financial_data_collector_agent_tool),
-        AgentTool(summarizer_agent_tool),
-        AgentTool(smart_goal_agent_tool),
-        google_search_tool
-    ]
+    tools=[financial_data_collector_agent_tool,summarizer_agent_tool,smart_goal_agent_tool,risk_assessment_agent_tool,scenario_modeling_agent_tool,tax_implication_agent_tool,debt_management_agent_tool,budget_optimizer_agent_tool,google_search_agent]
 )
 
 logger.info("Financial Planner Orchestrator Agent (root_agent) fully defined.")
