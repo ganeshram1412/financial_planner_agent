@@ -22,7 +22,12 @@ from asset_allocation_agent import asset_allocation_agent_tool
 # New Process Coverage Agents (3) - Education agents removed
 from goal_quantification_agent import goal_quantification_agent_tool       
 from deficiency_analysis_agent import deficiency_analysis_agent_tool     
-from implementation_guide_agent import implementation_guide_agent_tool   
+from implementation_guide_agent import implementation_guide_agent_tool
+
+from google.adk.tools.mcp_tool.mcp_toolset import (
+    MCPToolset,
+    SseConnectionParams,
+)
 
 # Education agents removed from imports:
 # from education_planning_agent import education_planning_agent_tool 
@@ -90,8 +95,13 @@ ORCHESTRATION WORKFLOW (Mapped to 6 Steps & Controlled):
 
 6.  **STEP 6: 🔄 Monitor, Review, and Adjust**
     * **Action (Summary):** Send the **FULL, final FSO** to the **`summarizer_agent`**.
-    * **Closure:** Share the final plan and conclude the session.
+    * **Closure:** Share the final plan and conclude the session. Also, create a flowchart for the plan using mermaid_mcp_toolset and provide url for output mermaid diagram. Mermaid generation issue don't provide response to user, try to fix it.
 """
+mermaid_mcp_toolset = MCPToolset(
+    connection_params=SseConnectionParams(
+        url="https://mcp.mermaidchart.com/sse"
+    )
+)
 # --- 5. The Root Orchestrator Agent Definition (Excluding Unnecessary Tools) ---
 
 root_agent = LlmAgent(
@@ -111,6 +121,6 @@ root_agent = LlmAgent(
         
         # Synthesis/Finalization Agents (2)
         AgentTool(summarizer_agent_tool),
-        AgentTool(google_search_agent)
+        AgentTool(google_search_agent),mermaid_mcp_toolset
     ]
 )
