@@ -72,6 +72,9 @@ from goal_quantification_agent import goal_quantification_agent_tool
 from deficiency_analysis_agent import deficiency_analysis_agent_tool
 from implementation_guide_agent import implementation_guide_agent_tool
 from .json_logging_plugin import JsonLoggingPlugin
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
 
 # Education agents removed from imports:
 # from education_planning_agent import education_planning_agent_tool
@@ -299,22 +302,63 @@ STEP 6: FINAL SUMMARY
 ---------------------------------------------------
 
 A) Summarizer  
-- Send full FSO  
+- Send the full FSO  
 - Tool: summarizer_agent  
 - Save: FSO.final_summary
 
-B) Final Output  
-- Provide:
+B) Final Output (for chat)  
+- Present to the user in chat:
   - Executive summary  
   - Asset allocation  
   - Tax steps  
   - Implementation checklist  
-  - Educational disclaimer
+  - Educational disclaimer  
+
+C) Email Delivery via MCP (Optional)
+- If the FSO contains a usable email address (for example:
+    FSO.user_email
+  or another clearly-labeled email field), then:
+  - Use the configured **email MCP toolset** (`email_mcp_toolset`) to send
+    the same Final Output to the client by email.
+  - From account: the preconfigured account named **"work"**.
+  - Subject: a short title such as:
+      "Your Personalized Financial Plan Summary"
+  - Body: a short, professional email that:
+      • Greets the client by name  
+      • Briefly summarizes the key points of the Final Output
+- Do NOT request or handle any email passwords. All authentication is managed
+  by the MCP email server configuration.
+- If no email is available in the FSO. Ask user for email, if provided send the email.
 
 =====================================================================
 END OF SYSTEM INSTRUCTION
 =====================================================================
 """
+EMAIL_ENV = {
+    "MCP_EMAIL_SERVER_ACCOUNT_NAME": os.getenv("MCP_EMAIL_SERVER_ACCOUNT_NAME", "work"),
+    "MCP_EMAIL_SERVER_FULL_NAME": os.getenv("MCP_EMAIL_SERVER_FULL_NAME", ""),
+    "MCP_EMAIL_SERVER_EMAIL_ADDRESS": os.getenv("MCP_EMAIL_SERVER_EMAIL_ADDRESS", ""),
+    "MCP_EMAIL_SERVER_USER_NAME": os.getenv("MCP_EMAIL_SERVER_USER_NAME", ""),
+    "MCP_EMAIL_SERVER_PASSWORD": os.getenv("MCP_EMAIL_SERVER_PASSWORD", ""),
+    "MCP_EMAIL_SERVER_IMAP_HOST": os.getenv("MCP_EMAIL_SERVER_IMAP_HOST", ""),
+    "MCP_EMAIL_SERVER_IMAP_PORT": os.getenv("MCP_EMAIL_SERVER_IMAP_PORT", ""),
+    "MCP_EMAIL_SERVER_SMTP_HOST": os.getenv("MCP_EMAIL_SERVER_SMTP_HOST", ""),
+    "MCP_EMAIL_SERVER_SMTP_PORT": os.getenv("MCP_EMAIL_SERVER_SMTP_PORT", ""),
+}
+
+email_mcp_toolset = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="uvx",   # launches the MCP email server
+            args=[
+                "mcp-email-server@latest",
+                "stdio",
+            ],
+            env=EMAIL_ENV,  # pass all email configs
+        ),
+        timeout=300,
+    )
+)
 
 # --- 5. The Root Orchestrator Agent Definition (Excluding Unnecessary Tools) ---
 # This is the single entrypoint agent your ADK app should call.
@@ -345,6 +389,6 @@ root_agent = LlmAgent(
         AgentTool(implementation_guide_agent_tool),
         # Synthesis/Finalization Agents (2)
         AgentTool(summarizer_agent_tool),
-        AgentTool(google_search_agent),
+        AgentTool(google_search_agent),email_mcp_toolset,
         ],
 )
