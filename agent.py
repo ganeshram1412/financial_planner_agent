@@ -36,7 +36,6 @@ It is responsible for:
   - implementation_guide_agent
   - summarizer_agent
   - google_search_agent
-  - mermaid_mcp_toolset (for visual plan generation via external MCP server)
 
 The orchestrator itself does not perform domain logic; it:
 - Receives the user message.
@@ -73,12 +72,6 @@ from goal_quantification_agent import goal_quantification_agent_tool
 from deficiency_analysis_agent import deficiency_analysis_agent_tool
 from implementation_guide_agent import implementation_guide_agent_tool
 from .json_logging_plugin import JsonLoggingPlugin
-from google.adk.apps.app import EventsCompactionConfig
-
-from google.adk.tools.mcp_tool.mcp_toolset import (
-    MCPToolset,
-    SseConnectionParams,
-)
 
 # Education agents removed from imports:
 # from education_planning_agent import education_planning_agent_tool
@@ -302,7 +295,7 @@ B) Implementation Guide
 - Save: FSO.implementation_plan
 
 ---------------------------------------------------
-STEP 6: FINAL SUMMARY & MERMAID PLAN VISUALIZATION
+STEP 6: FINAL SUMMARY
 ---------------------------------------------------
 
 A) Summarizer  
@@ -322,15 +315,6 @@ B) Final Output
 END OF SYSTEM INSTRUCTION
 =====================================================================
 """
-
-# Mermaid MCP toolset used by the orchestrator (called via tools list).
-# The root agent itself does not know how to render diagrams – it delegates to
-# this MCP server which returns a URL or artifact for visualization.
-mermaid_mcp_toolset = MCPToolset(
-    connection_params=SseConnectionParams(
-        url="https://mcp.mermaidchart.com/sse"
-    )
-)
 
 # --- 5. The Root Orchestrator Agent Definition (Excluding Unnecessary Tools) ---
 # This is the single entrypoint agent your ADK app should call.
@@ -362,6 +346,5 @@ root_agent = LlmAgent(
         # Synthesis/Finalization Agents (2)
         AgentTool(summarizer_agent_tool),
         AgentTool(google_search_agent),
-        mermaid_mcp_toolset,
-    ],
+        ],
 )
