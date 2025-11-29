@@ -1,4 +1,53 @@
-# financial_planner_agent.py - The Root Orchestrator (Six-Step Process & MAX Token Efficiency - Lean Version)
+"""
+financial_planner_agent.py
+
+Root Orchestrator for the multi-agent financial planning system.
+
+This module wires together all sub-agents into a single, token-efficient
+orchestration flow driven by a centralized Financial State Object (FSO).
+It is responsible for:
+
+- Enforcing a 6-step, CA/RIA-style planning workflow:
+  1. Data Collection (KYC, FSO V1 creation)
+  2. Goal Identification & Quantification
+  3. Diagnosis (Risk, Budget, Deficiency analysis)  → HARD PAUSE
+  4. Plan Design (Asset Allocation, Debt Plan, Scenario Modeling)
+  5. Implementation (Tax Optimization + Implementation Checklist)
+  6. Final Summary (Human narrative)
+
+- Maintaining GLOBAL CONTROL RULES such as:
+  - Hard pause after Step 3 (requires explicit user “PROCEED”)
+  - FSO sub-setting (never sending the full FSO to tools/agents)
+  - Central merge: each agent’s output is written back into FSO
+  - Token-aware use of Google Search for finance-term clarification
+  - Educational disclaimer at the end of the plan
+
+- Registering all agent tools with the ADK `LlmAgent` root orchestrator:
+  - financial_data_collector_agent
+  - smart_goal_agent
+  - goal_quantification_agent
+  - risk_assessment_agent
+  - budget_optimizer_agent
+  - deficiency_analysis_agent
+  - asset_allocation_agent
+  - debt_management_agent
+  - scenario_modeling_agent
+  - tax_implication_agent
+  - implementation_guide_agent
+  - summarizer_agent
+  - google_search_agent
+  - mermaid_mcp_toolset (for visual plan generation via external MCP server)
+
+The orchestrator itself does not perform domain logic; it:
+- Receives the user message.
+- Manages FSO evolution across steps.
+- Calls the right tools with minimal FSO subsets.
+- Enforces UX and safety constraints through the instruction prompt.
+
+This file is intended to remain thin and declarative:
+- No business rules here (those live in per-agent modules/tools).
+- Only wiring, configuration, and orchestration instructions.
+"""
 
 import logging
 import os
@@ -9,21 +58,22 @@ from google.adk.tools import google_search, AgentTool
 
 # --- 1. Sub-Agent Imports (The Lean Roster) ---
 # Core Analytical Agents (8)
-from smart_goal_agent import smart_goal_agent_tool 
-from summarizer_agent import summarizer_agent_tool 
-from financial_data_collector_agent import financial_data_collector_agent_tool 
+from smart_goal_agent import smart_goal_agent_tool
+from summarizer_agent import summarizer_agent_tool
+from financial_data_collector_agent import financial_data_collector_agent_tool
 from risk_assessment_agent import risk_assessment_agent_tool
 from scenario_modeling_agent import scenario_modeling_agent_tool
 from tax_implication_agent import tax_implication_agent_tool
 from debt_management_agent import debt_management_agent_tool
 from budget_optimizer_agent import budget_optimizer_agent_tool
-from asset_allocation_agent import asset_allocation_agent_tool 
+from asset_allocation_agent import asset_allocation_agent_tool
 
 # New Process Coverage Agents (3) - Education agents removed
-from goal_quantification_agent import goal_quantification_agent_tool       
-from deficiency_analysis_agent import deficiency_analysis_agent_tool     
+from goal_quantification_agent import goal_quantification_agent_tool
+from deficiency_analysis_agent import deficiency_analysis_agent_tool
 from implementation_guide_agent import implementation_guide_agent_tool
 from .json_logging_plugin import JsonLoggingPlugin
+from google.adk.apps.app import EventsCompactionConfig
 
 from google.adk.tools.mcp_tool.mcp_toolset import (
     MCPToolset,
@@ -31,44 +81,50 @@ from google.adk.tools.mcp_tool.mcp_toolset import (
 )
 
 # Education agents removed from imports:
-# from education_planning_agent import education_planning_agent_tool 
-# from educational_synthesis_agent import educational_synthesis_agent_tool 
+# from education_planning_agent import education_planning_agent_tool
+# from educational_synthesis_agent import educational_synthesis_agent_tool
 # -----------------------------
 
 # --- 2. Configuration and Logging Setup ---
-# (Standard configuration code)
-# ...
+# NOTE: This is global process logging (separate from structured JSON plugin logging).
 logging.basicConfig(
-    filename='app.log',
-    filemode='a',
+    filename="app.log",
+    filemode="a",
     level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    datefmt='%Y-%m-%d %H:%M:%S'
+    format="%(asctime)s - %(levelname)s - %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
 )
 
-# Define retry configuration for API calls
+# Define retry configuration for API calls to the LLM
 retry_config = types.HttpRetryOptions(
-    attempts=5, exp_base=7, initial_delay=1, http_status_codes=[429, 500, 503, 504],
+    attempts=5,
+    exp_base=7,
+    initial_delay=1,
+    http_status_codes=[429, 500, 503, 504],
 )
 
+# Plugin instance for structured, per-session / per-invocation JSON logging.
 logger_plugin_instance = JsonLoggingPlugin()
 
 # --- 3. Google Search Tool Definition ---
 google_search_agent = LlmAgent(
     name="GoogleSearchAgent",
     model="gemini-2.5-flash",
-    instruction="Answer questions using Google Search when needed. Always cite sources. Prioritize explaining financial concepts clearly and concisely.",
+    instruction=(
+        "Answer questions using Google Search when needed. "
+        "Always cite sources. Prioritize explaining financial concepts "
+        "clearly and concisely."
+    ),
     description="Professional search assistant for financial definitions.",
-    tools=[google_search]
+    tools=[google_search],
 )
 logging.info("Google search configured")
 
 # --- 4. The Root Orchestrator Instruction (Updated for Lean Workflow) ---
-
-# financial_planner_agent.py - The Root Orchestrator (Instruction Section Only)
-
-# financial_planner_agent.py - The Root Orchestrator (Instruction Section Only)
-
+# The prompt below encodes the entire orchestration contract for the root agent:
+# - Global control rules (hard pause, FSO subsetting, search usage)
+# - Six-step planning workflow
+# - Output expectations at the end of each major step
 financial_planner_agent_instruction = """
 You are **Viji**, the **Feedback-Driven Financial Planner Orchestrator**.  
 You manage the centralized Financial State Object (FSO) and delegate tasks systematically.  
@@ -118,7 +174,7 @@ GLOBAL CONTROL & PROCESS RULES
    - Use ONLY if:
      • Concept requires external validation  
      • Regulatory limits or tax rules need factual accuracy  
-   - DO NOT use for generic finance concepts or simple calculations.
+   - Use if user needs any help on finance term
 
 6. **COMMUNICATION STYLE**
    - Clear, empathetic, structured.
@@ -254,20 +310,12 @@ A) Summarizer
 - Tool: summarizer_agent  
 - Save: FSO.final_summary
 
-B) Mermaid Chart  
-- Use mermaid_mcp_toolset with full FSO.
-- Retry silently up to 5 times on syntax error.
-- If all retries fail:
-  - Continue WITHOUT Mermaid; DO NOT reveal retries.
-- Output ONLY the Mermaid Playground URL (no raw code).
-
-C) Final Output  
+B) Final Output  
 - Provide:
   - Executive summary  
   - Asset allocation  
   - Tax steps  
   - Implementation checklist  
-  - Mermaid plan URL  
   - Educational disclaimer
 
 =====================================================================
@@ -275,30 +323,45 @@ END OF SYSTEM INSTRUCTION
 =====================================================================
 """
 
+# Mermaid MCP toolset used by the orchestrator (called via tools list).
+# The root agent itself does not know how to render diagrams – it delegates to
+# this MCP server which returns a URL or artifact for visualization.
 mermaid_mcp_toolset = MCPToolset(
     connection_params=SseConnectionParams(
         url="https://mcp.mermaidchart.com/sse"
     )
 )
-# --- 5. The Root Orchestrator Agent Definition (Excluding Unnecessary Tools) ---
 
+# --- 5. The Root Orchestrator Agent Definition (Excluding Unnecessary Tools) ---
+# This is the single entrypoint agent your ADK app should call.
+# All sub-agents are exposed as tools, and the core orchestration logic is
+# encoded in `financial_planner_agent_instruction` above.
 root_agent = LlmAgent(
     name="financial_planner_orchestrator_agent",
     model=Gemini(model="gemini-2.5-flash", retry_options=retry_config),
-    description="The main orchestrator for comprehensive, empathetic financial planning using a centralized Financial State Object (FSO), mapped directly to the six-step CA/RIA process. Token-efficient by design.",
+    description=(
+        "The main orchestrator for comprehensive, empathetic financial planning "
+        "using a centralized Financial State Object (FSO), mapped directly to "
+        "the six-step CA/RIA process. Token-efficient by design."
+    ),
     instruction=financial_planner_agent_instruction,
     tools=[
         # Core Analytical Agents (8)
-        AgentTool(financial_data_collector_agent_tool), AgentTool(smart_goal_agent_tool), AgentTool(risk_assessment_agent_tool),
-        AgentTool(budget_optimizer_agent_tool), AgentTool(debt_management_agent_tool), AgentTool(tax_implication_agent_tool),
-        AgentTool(asset_allocation_agent_tool), AgentTool(scenario_modeling_agent_tool),
-        
+        AgentTool(financial_data_collector_agent_tool),
+        AgentTool(smart_goal_agent_tool),
+        AgentTool(risk_assessment_agent_tool),
+        AgentTool(budget_optimizer_agent_tool),
+        AgentTool(debt_management_agent_tool),
+        AgentTool(tax_implication_agent_tool),
+        AgentTool(asset_allocation_agent_tool),
+        AgentTool(scenario_modeling_agent_tool),
         # New Process Coverage Agents (3)
-        AgentTool(goal_quantification_agent_tool), AgentTool(deficiency_analysis_agent_tool),
+        AgentTool(goal_quantification_agent_tool),
+        AgentTool(deficiency_analysis_agent_tool),
         AgentTool(implementation_guide_agent_tool),
-        
         # Synthesis/Finalization Agents (2)
         AgentTool(summarizer_agent_tool),
-        AgentTool(google_search_agent),mermaid_mcp_toolset
-    ]
-    )
+        AgentTool(google_search_agent),
+        mermaid_mcp_toolset,
+    ],
+)

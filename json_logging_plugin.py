@@ -1,3 +1,58 @@
+"""
+json_logging_plugin.py
+----------------------
+
+Structured, production-grade logging plugin for Google ADK agents.
+
+This module defines:
+
+- A cost estimation helper for supported LLM models.
+- A JSON log formatter that emits single-line, ingestion-friendly log records.
+- A family of helper functions that create rotating, file-backed loggers
+  split by:
+      * session vs. invocation
+      * main / cost / error / debug channels
+- The `JsonLoggingPlugin` class, a `BasePlugin` implementation that hooks into
+  ADK lifecycle callbacks and emits:
+
+  * High-signal lifecycle logs to `main.log`
+      - user message previews
+      - agent/model/tool lifecycle events (before/after)
+      - latency metrics (agent/model/tool)
+      - per-turn token usage and human-readable cost summaries
+  * Structured cost and token logs to `cost.log`
+      - per-turn usage
+      - per-session summary (on idle)
+  * Error logs to `error.log`
+      - model failures and other error cases
+  * Deep diagnostic payloads to `debug.log` (optional)
+      - full user messages, tool args/results, etc., with optional redaction
+
+Directory layout (per agent):
+
+    logs/
+      <agent_slug>/
+        sessions/
+          <session_id>/
+            main.log    # high-level structured events & metrics
+            cost.log    # per-turn cost + per-session summaries
+            error.log   # error events
+            debug.log   # detailed payloads (optional)
+        invocations/
+          <invocation_id>/
+            main.log
+            cost.log
+            error.log
+            debug.log
+
+This plugin is designed to be:
+
+- **Production ready**: rotating files, structured JSON, minimal duplication.
+- **Ops friendly**: main logs stay compact; debug logs can be toggled or redacted.
+- **Token & latency aware**: aggregates usage at the session level and emits
+  a summary when the session has been idle for a configured interval.
+"""
+
 import json
 import logging
 import os
@@ -9,10 +64,6 @@ from typing import Optional, Any, Dict, Tuple
 from google.genai import types
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.agents import InvocationContext
-from google.adk.agents.callback_context import CallbackContext
-from google.adk.agents.base_agent import BaseAgent
-from google.adk.models.llm_request import LlmRequest
-from google.adk.models.llm_response import LlmResponse
 from google.adk.tools.tool_context import ToolContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.events import Event
@@ -38,9 +89,25 @@ def estimate_cost(
     completion_tokens: Optional[int],
 ) -> Optional[Dict[str, Any]]:
     """
-    Estimate cost for a single logical LLM turn.
+    Estimate monetary cost for a single LLM turn based on token usage.
 
-    Returns None if the model is not configured in MODEL_PRICING.
+    Args:
+        model_name: Name of the LLM model (must exist in MODEL_PRICING).
+        prompt_tokens: Number of input tokens consumed by the model.
+        completion_tokens: Number of output tokens produced by the model.
+
+    Returns:
+        A dictionary with cost breakdown:
+            {
+              "model": str,
+              "input_tokens": int,
+              "output_tokens": int,
+              "input_cost": float,
+              "output_cost": float,
+              "total_cost": float,
+              "currency": str,
+            }
+        or None if the model is not configured in MODEL_PRICING.
     """
     if not model_name or model_name not in MODEL_PRICING:
         return None
@@ -68,7 +135,15 @@ def estimate_cost(
 # -------------------------------------------------------------------
 
 class JsonFormatter(logging.Formatter):
-    """Pretty JSON log formatter with full, non-truncated content."""
+    """
+    JSON log formatter that emits single-line, ingestion-friendly records.
+
+    Features:
+        - Adds timestamp, severity, logger name, and base message.
+        - Merges extra structured fields (if provided under "extra_fields").
+        - Preserves primitive and container types as true JSON structures.
+        - Uses repr() for non-JSON-serializable objects (no truncation).
+    """
 
     def format(self, record: logging.LogRecord) -> str:
         log = {
@@ -82,7 +157,7 @@ class JsonFormatter(logging.Formatter):
         if isinstance(extra_fields, dict):
             safe: Dict[str, Any] = {}
             for k, v in extra_fields.items():
-                # Keep primitive + container types as true JSON, no repr()
+                # Keep primitive + container types as true JSON
                 if isinstance(v, (str, int, float, bool, dict, list)) or v is None:
                     safe[k] = v
                 elif isinstance(v, tuple):
@@ -92,7 +167,8 @@ class JsonFormatter(logging.Formatter):
                     safe[k] = repr(v)
             log.update(safe)
 
-        return json.dumps(log, ensure_ascii=False, indent=2)
+        # Single-line JSON: better for log ingestion
+        return json.dumps(log, ensure_ascii=False, separators=(",", ":"))
 
 
 # -------------------------------------------------------------------
@@ -101,13 +177,25 @@ class JsonFormatter(logging.Formatter):
 
 def _agent_slug(agent_name: str) -> str:
     """
-    Turn 'financial_data_collector_agent' into 'financial_data_collector'.
+    Normalize an agent name into a filesystem-safe slug.
+
+    Example:
+        "financial_data_collector_agent" → "financial_data_collector"
+
     Rules:
-      - lowercase
-      - split on '_' and '-'
-      - drop generic suffixes: agent, engine, module, service, tool
-      - join remaining tokens with '_'
-      - filesystem-safe, length-limited
+        - lowercase
+        - replace '-' with '_'
+        - split on '_' and drop generic suffixes:
+          {"agent", "engine", "module", "service", "tool"}
+        - join remaining tokens with '_'
+        - keep [A-Za-z0-9_] only
+        - truncate to max length of 60 characters
+
+    Args:
+        agent_name: Raw agent name from ADK.
+
+    Returns:
+        Sanitized slug string used in directory and logger names.
     """
     if not agent_name:
         return "agent"
@@ -132,8 +220,15 @@ def _agent_slug(agent_name: str) -> str:
 
 def _safe_str(value: Any) -> str:
     """
-    Convert any value to a log-safe string using repr/str.
-    No truncation, just best-effort stringification.
+    Convert any value to a robust string representation for logging.
+
+    Behavior:
+        - Prefer repr(value) for maximum detail.
+        - Fallback to str(value) if repr fails.
+        - If both fail, return a sentinel "<unserializable>".
+
+    This is used primarily in debug-level logs where full payloads
+    are useful for troubleshooting.
     """
     try:
         return repr(value)
@@ -142,6 +237,28 @@ def _safe_str(value: Any) -> str:
             return str(value)
         except Exception:
             return "<unserializable>"
+
+
+def _preview_str(value: Any, max_len: int = 200) -> str:
+    """
+    Return a shortened, human-friendly preview of a value.
+
+    Purpose:
+        - Keep `main.log` compact by logging only a short preview instead
+          of full payloads (which go to `debug.log`).
+
+    Args:
+        value: Any object to preview.
+        max_len: Maximum character length of the preview string.
+
+    Returns:
+        A string truncated to `max_len` characters, with "..." appended
+        if truncation occurred.
+    """
+    s = _safe_str(value)
+    if len(s) <= max_len:
+        return s
+    return s[: max_len - 3] + "..."
 
 
 # -------------------------------------------------------------------
@@ -155,8 +272,22 @@ def _get_rotating_logger(
     level: int = logging.INFO,
 ) -> logging.Logger:
     """
-    Create or return a RotatingFileHandler-based logger
-    writing JSON lines to base_dir/file_name.
+    Create or return a logger that writes JSON logs to a rotating file.
+
+    The logger is configured with:
+        - RotatingFileHandler (5 MB max per file, 5 backups)
+        - UTF-8 encoding
+        - JsonFormatter
+        - No propagation to root logger (avoids duplicate logs)
+
+    Args:
+        logger_name: Global logger name in the logging hierarchy.
+        base_dir: Directory path under which the file will be created.
+        file_name: File name (e.g., 'main.log').
+        level: Logging level for this logger.
+
+    Returns:
+        A configured `logging.Logger` instance.
     """
     logger = logging.getLogger(logger_name)
     logger.setLevel(level)
@@ -183,6 +314,12 @@ def get_agent_session_main_logger(
     session_id: str,
     lvl: int = logging.INFO,
 ) -> logging.Logger:
+    """
+    Get the per-session main logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/sessions/<session_id>/main.log
+    """
     slug = _agent_slug(agent_name)
     base_dir = os.path.join("logs", slug, "sessions", session_id)
     return _get_rotating_logger(
@@ -198,6 +335,12 @@ def get_agent_session_cost_logger(
     session_id: str,
     lvl: int = logging.INFO,
 ) -> logging.Logger:
+    """
+    Get the per-session cost logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/sessions/<session_id>/cost.log
+    """
     slug = _agent_slug(agent_name)
     base_dir = os.path.join("logs", slug, "sessions", session_id)
     return _get_rotating_logger(
@@ -213,6 +356,12 @@ def get_agent_session_error_logger(
     session_id: str,
     lvl: int = logging.INFO,
 ) -> logging.Logger:
+    """
+    Get the per-session error logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/sessions/<session_id>/error.log
+    """
     slug = _agent_slug(agent_name)
     base_dir = os.path.join("logs", slug, "sessions", session_id)
     return _get_rotating_logger(
@@ -223,11 +372,38 @@ def get_agent_session_error_logger(
     )
 
 
+def get_agent_session_debug_logger(
+    agent_name: str,
+    session_id: str,
+    lvl: int = logging.DEBUG,
+) -> logging.Logger:
+    """
+    Get the per-session debug logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/sessions/<session_id>/debug.log
+    """
+    slug = _agent_slug(agent_name)
+    base_dir = os.path.join("logs", slug, "sessions", session_id)
+    return _get_rotating_logger(
+        logger_name=f"{slug}_session_{session_id}_debug",
+        base_dir=base_dir,
+        file_name="debug.log",
+        level=lvl,
+    )
+
+
 def get_agent_invocation_main_logger(
     agent_name: str,
     invocation_id: str,
     lvl: int = logging.INFO,
 ) -> logging.Logger:
+    """
+    Get the per-invocation main logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/invocations/<invocation_id>/main.log
+    """
     slug = _agent_slug(agent_name)
     base_dir = os.path.join("logs", slug, "invocations", invocation_id)
     return _get_rotating_logger(
@@ -243,6 +419,12 @@ def get_agent_invocation_cost_logger(
     invocation_id: str,
     lvl: int = logging.INFO,
 ) -> logging.Logger:
+    """
+    Get the per-invocation cost logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/invocations/<invocation_id>/cost.log
+    """
     slug = _agent_slug(agent_name)
     base_dir = os.path.join("logs", slug, "invocations", invocation_id)
     return _get_rotating_logger(
@@ -258,6 +440,12 @@ def get_agent_invocation_error_logger(
     invocation_id: str,
     lvl: int = logging.INFO,
 ) -> logging.Logger:
+    """
+    Get the per-invocation error logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/invocations/<invocation_id>/error.log
+    """
     slug = _agent_slug(agent_name)
     base_dir = os.path.join("logs", slug, "invocations", invocation_id)
     return _get_rotating_logger(
@@ -268,33 +456,78 @@ def get_agent_invocation_error_logger(
     )
 
 
+def get_agent_invocation_debug_logger(
+    agent_name: str,
+    invocation_id: str,
+    lvl: int = logging.DEBUG,
+) -> logging.Logger:
+    """
+    Get the per-invocation debug logger for an agent.
+
+    Writes to:
+        logs/<agent_slug>/invocations/<invocation_id>/debug.log
+    """
+    slug = _agent_slug(agent_name)
+    base_dir = os.path.join("logs", slug, "invocations", invocation_id)
+    return _get_rotating_logger(
+        logger_name=f"{slug}_inv_{invocation_id}_debug",
+        base_dir=base_dir,
+        file_name="debug.log",
+        level=lvl,
+    )
+
+
 # -------------------------------------------------------------------
 # MAIN PLUGIN
 # -------------------------------------------------------------------
 
 class JsonLoggingPlugin(BasePlugin):
     """
-    ADK Plugin that logs key lifecycle events as structured JSON.
+    ADK plugin that emits structured, multi-channel JSON logs.
 
-    Folder layout:
+    Responsibilities:
+        - Attach to ADK lifecycle hooks (user message, agent/model/tool events,
+          generic events).
+        - Track per-session aggregates (tokens, cost, latency) and emit
+          a `session_summary` after idle periods.
+        - Split logs into:
+            * main.log   → high-level lifecycle + metrics + cost per turn
+            * cost.log   → cost and token usage (per-turn + summary)
+            * error.log  → model errors and failures
+            * debug.log  → full payloads (optional; can be redacted)
 
-      logs/
-        <agent_slug>/               # e.g. financial_planner_orchestrator
-          sessions/
-            <session_id>/
-              main.log   # lifecycle + context + usage summary + latency
-              cost.log   # cost/usage per turn + per-session summary
-              error.log  # errors
-          invocations/
-            <invocation_id>/
-              main.log
-              cost.log
-              error.log
+    Configuration flags:
+        - `level`: base log level for main/cost/error logs.
+        - `redact_sensitive`: if True, debug logs store "<redacted>" for
+          payload fields that may contain PII or sensitive data.
+        - `enable_debug_logs`: if False, debug log files are not written.
+
+    This plugin is intended to be reusable across agents in a production
+    environment and safe to use under high throughput.
     """
 
-    def __init__(self, level: int = logging.INFO) -> None:
+    def __init__(
+        self,
+        level: int = logging.INFO,
+        redact_sensitive: bool = False,
+        enable_debug_logs: bool = True,
+    ) -> None:
+        """
+        Initialize the JSON logging plugin with configurable behavior.
+
+        Args:
+            level:
+                Logging level for main/cost/error logs (e.g., logging.INFO).
+            redact_sensitive:
+                If True, any full payloads written to debug logs are replaced
+                with a "<redacted>" sentinel, preserving structure but not content.
+            enable_debug_logs:
+                If False, skips creating and writing to debug.log files entirely.
+        """
         super().__init__(name="json_logging")
         self.level = level
+        self.redact_sensitive = redact_sensitive
+        self.enable_debug_logs = enable_debug_logs
 
         # Per-session aggregated metrics (keyed by (agent_name, session_id))
         self._session_stats: Dict[Tuple[str, str], Dict[str, Any]] = {}
@@ -312,6 +545,15 @@ class JsonLoggingPlugin(BasePlugin):
         self,
         ctx: InvocationContext,
     ) -> Tuple[logging.Logger, logging.Logger]:
+        """
+        Resolve the main session and invocation logger pair for a context.
+
+        Args:
+            ctx: The current invocation context from ADK.
+
+        Returns:
+            A tuple of (session_main_logger, invocation_main_logger).
+        """
         session_logger = get_agent_session_main_logger(
             ctx.agent.name, ctx.session.id, self.level
         )
@@ -320,16 +562,47 @@ class JsonLoggingPlugin(BasePlugin):
         )
         return session_logger, invocation_logger
 
+    def _session_invocation_debug_loggers(
+        self,
+        ctx: InvocationContext,
+    ) -> Tuple[Optional[logging.Logger], Optional[logging.Logger]]:
+        """
+        Resolve debug loggers for a session + invocation, if enabled.
+
+        Args:
+            ctx: The current invocation context from ADK.
+
+        Returns:
+            Tuple of (session_debug_logger, invocation_debug_logger), or
+            (None, None) if `enable_debug_logs` is False.
+        """
+        if not self.enable_debug_logs:
+            return None, None
+
+        session_debug_logger = get_agent_session_debug_logger(
+            ctx.agent.name, ctx.session.id, logging.DEBUG
+        )
+        invocation_debug_logger = get_agent_invocation_debug_logger(
+            ctx.agent.name, ctx.invocation_id, logging.DEBUG
+        )
+        return session_debug_logger, invocation_debug_logger
+
     def _resolve_model_name_from_invocation(
         self,
         invocation_context: InvocationContext,
     ) -> Optional[str]:
         """
-        Best-effort resolution of model name for cost calculation.
+        Resolve the underlying model name for a given invocation.
 
-        Tries:
-          - agent.model if it's a string
-          - agent.model.model if it's a Gemini(...) or similar wrapper
+        Tries, in order:
+            - `agent.model` if it's a bare string
+            - `agent.model.model` if it's a Gemini(...) or similar wrapper
+
+        Args:
+            invocation_context: The ADK invocation context.
+
+        Returns:
+            The model name string if resolvable, otherwise None.
         """
         agent = invocation_context.agent
         if agent is None:
@@ -346,6 +619,8 @@ class JsonLoggingPlugin(BasePlugin):
         return None
 
     def _get_session_key(self, agent_name: str, session_id: str) -> Tuple[str, str]:
+        """
+        Construct a consistent dict key for session-level stats tracking."""
         return (agent_name, session_id)
 
     def _get_or_create_session_stats(
@@ -353,6 +628,16 @@ class JsonLoggingPlugin(BasePlugin):
         agent_name: str,
         session_id: str,
     ) -> Dict[str, Any]:
+        """
+        Retrieve or initialize the aggregated metrics structure for a session.
+
+        Metrics captured include:
+            - token totals (prompt, completion, total)
+            - total cost (est. using MODEL_PRICING)
+            - counts of model/tool/agent calls
+            - latency aggregates (sum/ max)
+            - last_event_ts (for idle-based summary emission)
+        """
         key = self._get_session_key(agent_name, session_id)
         stats = self._session_stats.get(key)
         if stats is None:
@@ -380,8 +665,10 @@ class JsonLoggingPlugin(BasePlugin):
 
     def _reset_session_aggregates(self, stats: Dict[str, Any]) -> None:
         """
-        Reset per-session aggregate counters while preserving identity.
-        Called after a session_summary is logged.
+        Reset session aggregate counters while preserving identity fields.
+
+        Called after a `session_summary` is logged due to idle timeout,
+        so subsequent turns start a fresh counting window.
         """
         stats["total_prompt_tokens"] = 0
         stats["total_completion_tokens"] = 0
@@ -401,10 +688,13 @@ class JsonLoggingPlugin(BasePlugin):
 
     def _log_session_summary(self, stats: Dict[str, Any]) -> None:
         """
-        Emit a session-level aggregated summary log.
-        Writes to:
-          - session main.log
-          - session cost.log
+        Emit a session-level summary event to main.log and cost.log.
+
+        Includes:
+            - token totals
+            - estimated total cost
+            - call counts (model/agent/tool)
+            - latency averages and maxima per component
         """
         agent_name = stats["agent_name"]
         session_id = stats["session_id"]
@@ -469,11 +759,19 @@ class JsonLoggingPlugin(BasePlugin):
         session_id: str,
     ) -> Dict[str, Any]:
         """
-        Get stats object, update last_event_ts, and emit + reset session_summary
-        if the session has been idle longer than idle_timeout_seconds.
+        Update session activity timestamp and emit summary on idle.
 
-        NOTE: Summary is emitted on the *next* event after the idle
-        period, not exactly at the 2-minute mark (no background scheduler).
+        Logic:
+            - If `last_event_ts` exists and the time difference from now is
+              >= `idle_timeout_seconds` AND at least one turn has occurred:
+                → Emit a `session_summary` event and reset aggregates.
+
+            - Always update `last_event_ts` to current time.
+
+        Note:
+            This is a lazy strategy: summary is generated upon the first
+            new event after a sufficiently long idle period (no background
+            scheduler).
         """
         stats = self._get_or_create_session_stats(agent_name, session_id)
         now_ts = time()
@@ -499,8 +797,14 @@ class JsonLoggingPlugin(BasePlugin):
         invocation_id: str,
     ) -> Dict[str, Any]:
         """
-        Get or create the per-invocation context map.
-        Used to enrich activity context (e.g. last tool, last user message).
+        Retrieve or initialize per-invocation metadata used for context.
+
+        This metadata is used to enrich event logs with:
+            - last user message
+            - last tool name + result preview
+            - last model name
+
+        The data can be cleaned up when `end_of_agent` is signaled.
         """
         key = (agent_name, session_id, invocation_id)
         meta = self._invocation_meta.get(key)
@@ -508,6 +812,21 @@ class JsonLoggingPlugin(BasePlugin):
             meta = {}
             self._invocation_meta[key] = meta
         return meta
+
+    def _maybe_redact(self, value: Any) -> str:
+        """
+        Return either a redacted sentinel or the full stringified payload.
+
+        Used for debug logs which may contain raw user messages or tool
+        inputs/outputs.
+
+        Behavior:
+            - If `self.redact_sensitive` is True → always return "<redacted>".
+            - Otherwise → return `_safe_str(value)`.
+        """
+        if self.redact_sensitive:
+            return "<redacted>"
+        return _safe_str(value)
 
     # ---------------------------------------------------------
     # USER MESSAGE
@@ -519,6 +838,23 @@ class JsonLoggingPlugin(BasePlugin):
         invocation_context: InvocationContext,
         user_message: types.Content,
     ) -> Optional[types.Content]:
+        """
+        Lifecycle hook for incoming user messages.
+
+        Behavior:
+            - Updates idle-based session stats.
+            - Stores the raw user message in invocation metadata.
+            - Writes a compact preview to `main.log`.
+            - Writes the full (or redacted) payload to `debug.log`
+              when debug logging is enabled.
+
+        Args:
+            invocation_context: ADK invocation context containing session & agent info.
+            user_message: The user `Content` object received by the agent.
+
+        Returns:
+            Always returns None (no message modification).
+        """
         agent_name = invocation_context.agent.name
         session_id = invocation_context.session.id
         invocation_id = invocation_context.invocation_id
@@ -541,18 +877,41 @@ class JsonLoggingPlugin(BasePlugin):
             self.level,
         )
 
-        fields = {
+        # MAIN LOG: only preview
+        fields_main = {
             "event": "user_message",
             "user_id": invocation_context.user_id,
             "session_id": session_id,
             "invocation_id": invocation_id,
             "app_name": invocation_context.app_name,
             "agent_name": agent_name,
-            "user_message_raw": _safe_str(user_message),
+            "user_message_preview": _preview_str(user_message),
         }
 
-        session_logger.info("user_message", extra={"extra_fields": fields})
-        invocation_logger.info("user_message", extra={"extra_fields": fields})
+        session_logger.info("user_message", extra={"extra_fields": fields_main})
+        invocation_logger.info("user_message", extra={"extra_fields": fields_main})
+
+        # DEBUG LOG: full payload (maybe redacted)
+        session_debug_logger, invocation_debug_logger = (
+            self._session_invocation_debug_loggers(invocation_context)
+        )
+        if session_debug_logger and invocation_debug_logger:
+            fields_debug = {
+                "event": "user_message_debug",
+                "user_id": invocation_context.user_id,
+                "session_id": session_id,
+                "invocation_id": invocation_id,
+                "app_name": invocation_context.app_name,
+                "agent_name": agent_name,
+                "user_message_raw": self._maybe_redact(user_message),
+            }
+            session_debug_logger.debug(
+                "user_message_debug", extra={"extra_fields": fields_debug}
+            )
+            invocation_debug_logger.debug(
+                "user_message_debug", extra={"extra_fields": fields_debug}
+            )
+
         return None
 
     # ---------------------------------------------------------
@@ -565,6 +924,15 @@ class JsonLoggingPlugin(BasePlugin):
         agent: BaseAgent,
         callback_context: CallbackContext,
     ) -> None:
+        """
+        Lifecycle hook fired immediately before an agent handles a request.
+
+        Behavior:
+            - Touches session stats for idle detection.
+            - Increments `total_agent_calls`.
+            - Starts a high-resolution timer for agent latency.
+            - Logs metadata (agent name, description) to `main.log`.
+        """
         ctx = callback_context._invocation_context
 
         # Touch stats (idle detection)
@@ -599,6 +967,14 @@ class JsonLoggingPlugin(BasePlugin):
         agent: BaseAgent,
         callback_context: CallbackContext,
     ) -> None:
+        """
+        Lifecycle hook fired immediately after an agent finishes a request.
+
+        Behavior:
+            - Computes agent-level latency using stored start time.
+            - Aggregates latency into per-session stats.
+            - Logs latency and context to `main.log`.
+        """
         ctx = callback_context._invocation_context
 
         # Touch stats (idle detection)
@@ -637,6 +1013,15 @@ class JsonLoggingPlugin(BasePlugin):
         callback_context: CallbackContext,
         llm_request: LlmRequest,
     ) -> None:
+        """
+        Lifecycle hook fired before a direct LLM/model call.
+
+        Behavior:
+            - Touches session stats for idle detection.
+            - Starts a timer for model latency.
+            - Stores the model name in callback state for later use.
+            - Logs model configuration (temperature, top_p, etc.) to `main.log`.
+        """
         ctx = callback_context._invocation_context
 
         # Touch stats (idle detection)
@@ -676,8 +1061,18 @@ class JsonLoggingPlugin(BasePlugin):
         llm_response: LlmResponse,
     ) -> None:
         """
-        Logs model call outcome (errors/interruption, raw usage if available).
-        Cost is handled centrally in on_event_callback using turn-level usage.
+        Lifecycle hook fired after a direct LLM/model call completes.
+
+        Notes:
+            - This method does NOT handle cost; cost is computed centrally
+              in `on_event_callback` using turn-level usage metadata.
+
+        Behavior:
+            - Updates per-session model call count.
+            - Computes model latency and aggregates its stats.
+            - Reads raw usage tokens (prompt/completion) if available.
+            - Stores last model name in invocation metadata.
+            - Logs latency and token usage to `main.log`.
         """
         ctx = callback_context._invocation_context
 
@@ -744,6 +1139,17 @@ class JsonLoggingPlugin(BasePlugin):
         llm_request: LlmRequest,
         error: Exception,
     ) -> Optional[LlmResponse]:
+        """
+        Lifecycle hook fired when a model call raises an exception.
+
+        Behavior:
+            - Touches session stats for idle detection.
+            - Logs the error (type + message + model name) to:
+                * session main.log
+                * invocation main.log
+                * session error.log
+                * invocation error.log
+        """
         ctx = callback_context._invocation_context
 
         # Touch stats (idle detection)
@@ -789,30 +1195,61 @@ class JsonLoggingPlugin(BasePlugin):
         tool_context: ToolContext,
         tool_args: Dict[str, Any],
     ) -> None:
+        """
+        Lifecycle hook fired immediately before a tool is invoked.
+
+        Behavior:
+            - Touches session stats for idle detection.
+            - Starts a timer for tool latency.
+            - Logs a compact view (tool name + arg keys) to `main.log`.
+            - Logs full tool arguments to `debug.log` (redacted if configured).
+        """
         ctx = tool_context._invocation_context
 
         # Touch stats (idle detection)
         self._touch_session_stats(ctx.agent.name, ctx.session.id)
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
+        session_debug_logger, invocation_debug_logger = (
+            self._session_invocation_debug_loggers(ctx)
+        )
 
         # Tool latency start (use tool_context.state if available)
         state = getattr(tool_context, "state", None)
         if isinstance(state, dict):
             state["tool_start_ts"] = perf_counter()
 
-        fields = {
+        # MAIN LOG: only keys / preview
+        fields_main = {
             "event": "before_tool",
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
             "agent_name": ctx.agent.name,
             "tool_name": tool.name,
-            "tool_args_raw": _safe_str(tool_args),
+            "tool_arg_keys": list(tool_args.keys()),
         }
 
-        session_logger.info("before_tool", extra={"extra_fields": fields})
-        invocation_logger.info("before_tool", extra={"extra_fields": fields})
+        session_logger.info("before_tool", extra={"extra_fields": fields_main})
+        invocation_logger.info("before_tool", extra={"extra_fields": fields_main})
+
+        # DEBUG LOG: full args
+        if session_debug_logger and invocation_debug_logger:
+            fields_debug = {
+                "event": "before_tool_debug",
+                "user_id": ctx.user_id,
+                "session_id": ctx.session.id,
+                "invocation_id": ctx.invocation_id,
+                "agent_name": ctx.agent.name,
+                "tool_name": tool.name,
+                "tool_args_raw": self._maybe_redact(tool_args),
+            }
+            session_debug_logger.debug(
+                "before_tool_debug", extra={"extra_fields": fields_debug}
+            )
+            invocation_debug_logger.debug(
+                "before_tool_debug", extra={"extra_fields": fields_debug}
+            )
 
     async def after_tool_callback(
         self,
@@ -822,6 +1259,16 @@ class JsonLoggingPlugin(BasePlugin):
         tool_context: ToolContext,
         result: dict,
     ) -> None:
+        """
+        Lifecycle hook fired immediately after a tool returns a result.
+
+        Behavior:
+            - Updates per-session tool call count.
+            - Computes tool latency and aggregates per-session stats.
+            - Stores last tool name + result preview in invocation metadata.
+            - Logs a summary line (latency + short result preview) to `main.log`.
+            - Logs full result payload to `debug.log` (redacted if configured).
+        """
         ctx = tool_context._invocation_context
 
         # Touch stats (idle detection) and get stats
@@ -830,6 +1277,9 @@ class JsonLoggingPlugin(BasePlugin):
         stats["total_tool_calls"] += 1
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
+        session_debug_logger, invocation_debug_logger = (
+            self._session_invocation_debug_loggers(ctx)
+        )
 
         # Tool latency
         tool_latency_ms = None
@@ -851,9 +1301,10 @@ class JsonLoggingPlugin(BasePlugin):
             ctx.agent.name, ctx.session.id, ctx.invocation_id
         )
         meta["last_tool_name"] = tool.name
-        meta["last_tool_result_preview"] = _safe_str(result)
+        meta["last_tool_result_preview"] = _preview_str(result)
 
-        fields = {
+        # MAIN LOG: summary
+        fields_main = {
             "event": "after_tool",
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
@@ -861,14 +1312,33 @@ class JsonLoggingPlugin(BasePlugin):
             "agent_name": ctx.agent.name,
             "tool_name": tool.name,
             "tool_latency_ms": tool_latency_ms,
-            "tool_result_raw": _safe_str(result),
+            "tool_result_preview": _preview_str(result),
         }
 
-        session_logger.info("after_tool", extra={"extra_fields": fields})
-        invocation_logger.info("after_tool", extra={"extra_fields": fields})
+        session_logger.info("after_tool", extra={"extra_fields": fields_main})
+        invocation_logger.info("after_tool", extra={"extra_fields": fields_main})
+
+        # DEBUG LOG: full result
+        if session_debug_logger and invocation_debug_logger:
+            fields_debug = {
+                "event": "after_tool_debug",
+                "user_id": ctx.user_id,
+                "session_id": ctx.session.id,
+                "invocation_id": ctx.invocation_id,
+                "agent_name": ctx.agent.name,
+                "tool_name": tool.name,
+                "tool_latency_ms": tool_latency_ms,
+                "tool_result_raw": self._maybe_redact(result),
+            }
+            session_debug_logger.debug(
+                "after_tool_debug", extra={"extra_fields": fields_debug}
+            )
+            invocation_debug_logger.debug(
+                "after_tool_debug", extra={"extra_fields": fields_debug}
+            )
 
     # ---------------------------------------------------------
-    # GENERIC EVENT HOOK (TURN-LEVEL TOKEN USAGE + COST)
+    # GENERIC EVENT HOOK (TURN-LEVEL TOKEN USAGE + COST + ACTIONS)
     # ---------------------------------------------------------
 
     async def on_event_callback(
@@ -877,7 +1347,30 @@ class JsonLoggingPlugin(BasePlugin):
         invocation_context: InvocationContext,
         event: Event,
     ) -> Optional[Event]:
+        """
+        Generic event hook used for turn-level token usage and cost logging.
 
+        Behavior:
+            - Extracts usage metadata (prompt, candidate, total tokens).
+            - Updates per-session aggregates (tokens, total_turns).
+            - Estimates cost using `estimate_cost` and the resolved model name.
+            - Collects a rich `activity` block including:
+                * event name
+                * last tool + result preview
+                * last user message preview
+                * last model name
+                * actions metadata (transfers, escalations, compaction, etc.)
+            - Writes:
+                * human-readable one-line cost summary to `main.log`
+                * structured token/cost record to:
+                    - session main.log
+                    - invocation main.log
+                    - session cost.log
+                    - invocation cost.log
+
+        Returns:
+            Always returns None (no modification to the underlying Event).
+        """
         agent_name = invocation_context.agent.name
         session_id = invocation_context.session.id
         invocation_id = invocation_context.invocation_id
@@ -936,11 +1429,51 @@ class JsonLoggingPlugin(BasePlugin):
         )
 
         # -------------------------------
-        # INVOCATION META (CONTEXT)
+        # INVOCATION META (context you already track)
         # -------------------------------
         meta = self._invocation_meta.get(
             (agent_name, session_id, invocation_id), {}
         )
+
+        # -------------------------------
+        # ACTIONS META FROM EventActions
+        # -------------------------------
+        actions = getattr(event, "actions", None)
+        actions_meta = None
+        if actions is not None:
+            # Build a compact, queryable snapshot of workflow actions
+            actions_meta = {
+                "skip_summarization": actions.skip_summarization,
+                "transfer_to_agent": actions.transfer_to_agent,
+                "escalate": actions.escalate,
+                "end_of_agent": actions.end_of_agent,
+                "rewind_before_invocation_id": actions.rewind_before_invocation_id,
+                # lightweight sizes to avoid dumping giant blobs
+                "state_delta_keys": list(actions.state_delta.keys())
+                if actions.state_delta
+                else [],
+                "artifact_delta": actions.artifact_delta or {},
+                "requested_auth_count": len(actions.requested_auth_configs)
+                if actions.requested_auth_configs
+                else 0,
+                "requested_tool_confirmations_count": len(
+                    actions.requested_tool_confirmations
+                )
+                if actions.requested_tool_confirmations
+                else 0,
+                "has_compaction": actions.compaction is not None,
+                # basic compaction metadata:
+                "compaction_start_ts": actions.compaction.start_timestamp
+                if actions.compaction
+                else None,
+                "compaction_end_ts": actions.compaction.end_timestamp
+                if actions.compaction
+                else None,
+            }
+
+        # If end_of_agent, clean up invocation meta to avoid unbounded growth
+        if actions_meta and actions_meta.get("end_of_agent"):
+            self._invocation_meta.pop((agent_name, session_id, invocation_id), None)
 
         # -------------------------------
         # STRUCTURED activity block
@@ -954,14 +1487,32 @@ class JsonLoggingPlugin(BasePlugin):
             "last_tool_result_preview": meta.get("last_tool_result_preview"),
             "last_user_message": meta.get("last_user_message_raw"),
             "last_model_name": meta.get("last_model_name"),
+            "actions": actions_meta,
         }
 
         # -------------------------------
         # Human readable form
         # -------------------------------
+        # Add a small suffix to highlight special actions
+        action_tags = []
+        if actions_meta:
+            if actions_meta.get("transfer_to_agent"):
+                action_tags.append(f"transfer_to_agent={actions_meta['transfer_to_agent']}")
+            if actions_meta.get("escalate"):
+                action_tags.append("escalate=True")
+            if actions_meta.get("end_of_agent"):
+                action_tags.append("end_of_agent=True")
+            if actions_meta.get("rewind_before_invocation_id"):
+                action_tags.append(
+                    f"rewind_to={actions_meta['rewind_before_invocation_id']}"
+                )
+            if actions_meta.get("has_compaction"):
+                action_tags.append("compacted=True")
+
+        actions_suffix = f" | actions: {', '.join(action_tags)}" if action_tags else ""
         human_activity = (
             f"Activity '{event_name}' for agent={agent_name}, "
-            f"session={session_id}, invocation={invocation_id}"
+            f"session={session_id}, invocation={invocation_id}{actions_suffix}"
         )
 
         # -------------------------------
