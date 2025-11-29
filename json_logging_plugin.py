@@ -14,6 +14,7 @@ from google.adk.models.llm_request import LlmRequest
 from google.adk.models.llm_response import LlmResponse
 from google.adk.tools.tool_context import ToolContext
 from google.adk.tools.base_tool import BaseTool
+from google.adk.events import Event
 
 
 # -------------------------------------------------------------------
@@ -506,7 +507,7 @@ class JsonLoggingPlugin(BasePlugin):
             "invocation_id": ctx.invocation_id,
             "agent_name": ctx.agent.name,
             "tool_name": tool.name,
-            "tool_arg_keys": list(tool_args.keys()),
+            "tool_args": json.dumps(tool_args),
         }
 
         session_logger.info("before_tool", extra={"extra_fields": fields})
@@ -535,3 +536,45 @@ class JsonLoggingPlugin(BasePlugin):
 
         session_logger.info("after_tool", extra={"extra_fields": fields})
         invocation_logger.info("after_tool", extra={"extra_fields": fields})
+
+    async def on_event_callback(
+    self, *, invocation_context: InvocationContext, event: Event
+) -> Optional[Event]:
+    
+        session_logger, invocation_logger = self._session_invocation_loggers(invocation_context)
+    
+    # Initialize variables for the current event's token count
+    # Note: These will reset on every call, only showing the current event's usage.
+        prompt_count = 0
+        candidate_count = 0
+        total_count = 0
+
+        if event.usage_metadata:
+        # 1. Safely extract token counts, using 'or 0' to handle any potential None values 
+        # within the usage_metadata object attributes.
+            prompt_count = event.usage_metadata.prompt_token_count or 0
+            candidate_count = event.usage_metadata.candidates_token_count or 0
+            total_count = event.usage_metadata.total_token_count or 0
+
+        # 2. Log the Turn tokens using the safe, local variables (prompt_count, etc.)
+        # This prevents the 'NoneType' error by not accessing event.usage_metadata 
+        # attributes directly in the f-string.
+            session_logger.info(
+            'Turn tokens:'
+            f' {total_count} (prompt={prompt_count}, candidates={candidate_count})'
+            )
+
+        # 3. Log JSON fields for token usage (Recommended for structured logging)
+            fields = {
+            "event": "turn_token_usage",
+            "session_id": invocation_context.session.id,
+            "invocation_id": invocation_context.invocation_id,
+            "agent_name": invocation_context.agent.name,
+            "prompt_tokens_turn": prompt_count,
+            "candidate_tokens_turn": candidate_count,
+            "total_tokens_turn": total_count,
+            }
+            session_logger.info("token_usage", extra={"extra_fields": fields})
+            invocation_logger.info("token_usage", extra={"extra_fields": fields})
+
+        return None
