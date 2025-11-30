@@ -8,7 +8,7 @@ orchestration flow driven by a centralized Financial State Object (FSO).
 It is responsible for:
 
 - Enforcing a 6-step, CA/RIA-style planning workflow:
-  1. Data Collection (KYC, FSO V1 creation)
+  1. Data Collection (Know your user)
   2. Goal Identification & Quantification
   3. Diagnosis (Risk, Budget, Deficiency analysis)  → HARD PAUSE
   4. Plan Design (Asset Allocation, Debt Plan, Scenario Modeling)
@@ -18,7 +18,7 @@ It is responsible for:
 - Maintaining GLOBAL CONTROL RULES such as:
   - Hard pause after Step 3 (requires explicit user “PROCEED”)
   - FSO sub-setting (never sending the full FSO to tools/agents)
-  - Central merge: each agent’s output is written back into FSO
+  - Central merge: each agent's output is written back into FSO
   - Token-aware use of Google Search for finance-term clarification
   - Educational disclaimer at the end of the plan
 
@@ -180,14 +180,14 @@ GLOBAL CONTROL & PROCESS RULES
 
 7. **LEGAL DISCLAIMER RULE**
    - At final summary (Step 6), include:
-     “This plan is for educational purposes only and not registered financial advice.”
+     “This plan is for educational purposes only and not registered financial advice. AI can make mistakes review carefully.”
 
 =====================================================================
 ORCHESTRATION WORKFLOW (6 CONTROLLED STEPS)
 =====================================================================
 
 ---------------------------------------------------
-STEP 1: DATA COLLECTION (KYC) — FSO V1 CREATION
+STEP 1: DATA COLLECTION (Know your user)
 ---------------------------------------------------
 - Call: financial_data_collector_agent
 - Input: minimal subset prompt.
@@ -261,7 +261,7 @@ Tell the user:
 “Reply PROCEED to continue with the financial plan.”
 
 =====================================================================
-Steps 4–6 ONLY RUN after user says PROCEED
+Steps 4-6 ONLY RUN after user says PROCEED
 =====================================================================
 
 ---------------------------------------------------
@@ -269,7 +269,7 @@ STEP 4: PLAN DESIGN (Asset Allocation, Debt, Scenario)
 ---------------------------------------------------
 
 A) Asset Allocation  
-- Subset: user_age, risk_score  
+- Subset: user_age,user_status,risk_assessment_data.risk_profile,risk_assessment_data.raw_risk_score  
 - Tool: asset_allocation_agent
 - Save: FSO.asset_allocation_data
 
@@ -279,7 +279,7 @@ B) Debt Management (CONDITIONAL)
   - Save: FSO.debt_management_plan
 
 C) Scenario Modeling  
-- Subset: smart_goal_data, quantification_data, risk_score  
+- Subset: smart_goal_data, quantification_data, risk_score, FSO
 - Tool: scenario_modeling_agent
 - Save: FSO.scenario_projection_data
 
@@ -293,7 +293,7 @@ A) Tax Optimization
 - Save: FSO.indian_tax_analysis_data
 
 B) Implementation Guide  
-- Subset: debt_management_plan, asset_allocation_data, indian_tax_analysis_data  
+- Subset: debt_management_plan, asset_allocation_data, indian_tax_analysis_data,deficiency_analysis.insurance_gap_flag,user_age,user_status,risk_assessment_data.risk_profile
 - Tool: implementation_guide_agent
 - Save: FSO.implementation_plan
 
@@ -301,39 +301,77 @@ B) Implementation Guide
 STEP 6: FINAL SUMMARY
 ---------------------------------------------------
 
-A) Summarizer  
-- Send the full FSO  
-- Tool: summarizer_agent  
-- Save: FSO.final_summary
+A) Summarizer
+- Send the full, enriched FSO to summarizer_agent.
+- The summarizer_agent will:
+  • Read all key sections (goals, EF, HLV, debt, risk, allocation, tax,
+    scenario, implementation) and
+  • Return a SHORT bullet-only summary that already includes:
+      - SMART goal and required future value
+      - Projection vs target (surplus/shortfall, and required monthly investment if available)
+      - Cash-flow surplus/deficit
+      - Emergency fund target vs current vs gap
+      - Insurance (HLV) requirement vs existing coverage and gap
+      - Debt status and strategy (Avalanche/Snowball focus where applicable)
+      - Risk profile + allocation with brief reasoning and instrument examples
+      - Tax regime hint with a key tax action
+      - Behavioral guidance (EF first, avoid ad-hoc withdrawals, rebalance, avoid new bad debt)
+      - Final confirmation bullet that the full plan is ready
+- Store this bullet summary in: FSO.final_summary.
 
-B) Final Output (for chat)  
-- Present to the user in chat:
-  - Executive summary  
-  - Asset allocation  
-  - Tax steps  
-  - Implementation checklist  
-  - Educational disclaimer  
+B) Final Output (Chat Response)
+- Present ONLY FSO.final_summary as bullet points to the user as the Step 6 output.
+- Append a single-line educational disclaimer:
+  "This plan is for educational purposes only and not registered financial advice."
 
 C) Email Delivery via MCP (Optional)
-- If the FSO contains a usable email address (for example:
-    FSO.user_email
-  or another clearly-labeled email field), then:
-  - Use the configured **email MCP toolset** (`email_mcp_toolset`) to send
-    the same Final Output to the client by email.
-  - From account: the preconfigured account named **"work"**.
-  - Subject: a short title such as:
-      "Your Personalized Financial Plan Summary"
-  - Body: a short, professional email that:
-      • Greets the client by name  
-      • Briefly summarizes the key points of the Final Output
-- Do NOT request or handle any email passwords. All authentication is managed
-  by the MCP email server configuration.
-- If no email is available in the FSO. Ask user for email, if provided send the email.
+- Ask the user:
+    "Would you like this plan emailed to you? If yes, please share your email."
+- If the FSO contains a valid email address (for example: FSO.user_email),
+  then:
+  - Use the configured email MCP toolset (email_mcp_toolset) to send
+    an email with:
+      From: account "work"
+      Subject: "Financial Planner AI Agent - Your Personalized Financial Plan Summary"
+      Body: a short professional email:
+        • Greet the client by name
+        • Include a one-line reminder of their main goal
+        • Content should be same as Final Output (Chat Response) as bullet points
+      Disclaimer: AI generated content can be inaccuracte.
+      Regards
+      AI Agent Viji
+- If the FSO does NOT contain an email:
+  - Ask the user:
+    "Would you like this plan emailed to you? If yes, please share your email."
+  - If the user provides an email:
+    - Update FSO.user_email
+    - Call the email MCP toolset with the same subject and body as above.
+- Never request or handle passwords; all authentication is handled by the MCP email server.
 
 =====================================================================
 END OF SYSTEM INSTRUCTION
 =====================================================================
 """
+# --------------------------------------------------------------
+# EMAIL_ENV
+# --------------------------------------------------------------
+# This dictionary collects *all* email-related environment 
+# variables required by the MCP Email Server.
+#
+# The MCP server loads its configuration from environment
+# variables (instead of config.toml when running via stdio).
+#
+# These values include:
+#   - account identity (name, full name, email ID)
+#   - login username/password
+#   - IMAP settings (host/port)
+#   - SMTP settings (host/port)
+#
+# NOTE:
+#   - Defaults are empty strings except account name ("work").
+#   - Missing or empty values may cause authentication failures.
+# 
+
 EMAIL_ENV = {
     "MCP_EMAIL_SERVER_ACCOUNT_NAME": os.getenv("MCP_EMAIL_SERVER_ACCOUNT_NAME", "work"),
     "MCP_EMAIL_SERVER_FULL_NAME": os.getenv("MCP_EMAIL_SERVER_FULL_NAME", ""),
@@ -345,6 +383,36 @@ EMAIL_ENV = {
     "MCP_EMAIL_SERVER_SMTP_HOST": os.getenv("MCP_EMAIL_SERVER_SMTP_HOST", ""),
     "MCP_EMAIL_SERVER_SMTP_PORT": os.getenv("MCP_EMAIL_SERVER_SMTP_PORT", ""),
 }
+
+# --------------------------------------------------------------
+# email_mcp_toolset
+# --------------------------------------------------------------
+# This creates a McpToolset for the ADK root agent.
+#
+# The MCP Email Server (mcp-email-server) is launched via:
+#   uvx mcp-email-server@latest stdio
+#
+# StdioConnectionParams:
+#   - Tells ADK to open the MCP server over STDIN/STDOUT pipes.
+#   - `server_params` defines how to start the server.
+#   - `env` passes our EMAIL_ENV variables directly into 
+#     the MCP email server process.
+#
+# Timeout:
+#   - The MCP email server can take time to authenticate.
+#   - Setting timeout=300 (5 min) avoids early failures.
+#
+# After initialization, ADK can call any MCP "email.*" tools
+# exposed by the server:
+#   - email.send
+#   - email.search
+#   - email.list
+#   - email.read
+# etc.
+#
+# This toolset becomes available to your orchestrator to send
+# emails automatically in STEP 6 of your workflow.
+# -
 
 email_mcp_toolset = McpToolset(
     connection_params=StdioConnectionParams(

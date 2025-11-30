@@ -51,11 +51,16 @@ This plugin is designed to be:
 - **Ops friendly**: main logs stay compact; debug logs can be toggled or redacted.
 - **Token & latency aware**: aggregates usage at the session level and emits
   a summary when the session has been idle for a configured interval.
+
+NEW:
+- Per-session `trace_id` (UUID4) is generated once and attached to ALL logs
+  for that session and its invocations, enabling end-to-end traceability.
 """
 
 import json
 import logging
 import os
+import uuid
 from logging.handlers import RotatingFileHandler
 from datetime import datetime
 from time import perf_counter, time
@@ -64,6 +69,10 @@ from typing import Optional, Any, Dict, Tuple
 from google.genai import types
 from google.adk.plugins.base_plugin import BasePlugin
 from google.adk.agents import InvocationContext
+from google.adk.agents.callback_context import CallbackContext
+from google.adk.agents.base_agent import BaseAgent
+from google.adk.models.llm_request import LlmRequest
+from google.adk.models.llm_response import LlmResponse
 from google.adk.tools.tool_context import ToolContext
 from google.adk.tools.base_tool import BaseTool
 from google.adk.events import Event
@@ -495,6 +504,8 @@ class JsonLoggingPlugin(BasePlugin):
             * cost.log   → cost and token usage (per-turn + summary)
             * error.log  → model errors and failures
             * debug.log  → full payloads (optional; can be redacted)
+        - Attach a per-session `trace_id` (UUID) to ALL log entries so that
+          root agent + sub-agents + tools can be correlated end-to-end.
 
     Configuration flags:
         - `level`: base log level for main/cost/error logs.
@@ -620,7 +631,8 @@ class JsonLoggingPlugin(BasePlugin):
 
     def _get_session_key(self, agent_name: str, session_id: str) -> Tuple[str, str]:
         """
-        Construct a consistent dict key for session-level stats tracking."""
+        Construct a consistent dict key for session-level stats tracking.
+        """
         return (agent_name, session_id)
 
     def _get_or_create_session_stats(
@@ -637,6 +649,7 @@ class JsonLoggingPlugin(BasePlugin):
             - counts of model/tool/agent calls
             - latency aggregates (sum/ max)
             - last_event_ts (for idle-based summary emission)
+            - trace_id (stable per session, used for cross-agent tracing)
         """
         key = self._get_session_key(agent_name, session_id)
         stats = self._session_stats.get(key)
@@ -644,6 +657,7 @@ class JsonLoggingPlugin(BasePlugin):
             stats = {
                 "agent_name": agent_name,
                 "session_id": session_id,
+                "trace_id": str(uuid.uuid4()),  # NEW: stable trace id per session
                 "total_prompt_tokens": 0,
                 "total_completion_tokens": 0,
                 "total_tokens": 0,
@@ -669,6 +683,9 @@ class JsonLoggingPlugin(BasePlugin):
 
         Called after a `session_summary` is logged due to idle timeout,
         so subsequent turns start a fresh counting window.
+
+        NOTE: trace_id is intentionally preserved so the whole session
+        can be traced consistently.
         """
         stats["total_prompt_tokens"] = 0
         stats["total_completion_tokens"] = 0
@@ -695,9 +712,11 @@ class JsonLoggingPlugin(BasePlugin):
             - estimated total cost
             - call counts (model/agent/tool)
             - latency averages and maxima per component
+            - trace_id for correlation
         """
         agent_name = stats["agent_name"]
         session_id = stats["session_id"]
+        trace_id = stats.get("trace_id")
 
         session_logger = get_agent_session_main_logger(
             agent_name,
@@ -732,6 +751,7 @@ class JsonLoggingPlugin(BasePlugin):
 
         fields = {
             "event": "session_summary",
+            "trace_id": trace_id,
             "agent_name": agent_name,
             "session_id": session_id,
             "total_turns": stats["total_turns"],
@@ -784,7 +804,7 @@ class JsonLoggingPlugin(BasePlugin):
         ):
             # Idle for >= threshold → emit summary for previous segment
             self._log_session_summary(stats)
-            # Reset aggregates for next segment
+            # Reset aggregates for next segment (trace_id preserved)
             self._reset_session_aggregates(stats)
 
         stats["last_event_ts"] = now_ts
@@ -859,8 +879,9 @@ class JsonLoggingPlugin(BasePlugin):
         session_id = invocation_context.session.id
         invocation_id = invocation_context.invocation_id
 
-        # Touch stats (idle detection)
-        self._touch_session_stats(agent_name, session_id)
+        # Touch stats (idle detection) & get trace id
+        stats = self._touch_session_stats(agent_name, session_id)
+        trace_id = stats.get("trace_id")
 
         # Update invocation meta (for activity context)
         meta = self._get_invocation_meta(agent_name, session_id, invocation_id)
@@ -880,6 +901,7 @@ class JsonLoggingPlugin(BasePlugin):
         # MAIN LOG: only preview
         fields_main = {
             "event": "user_message",
+            "trace_id": trace_id,
             "user_id": invocation_context.user_id,
             "session_id": session_id,
             "invocation_id": invocation_id,
@@ -887,9 +909,9 @@ class JsonLoggingPlugin(BasePlugin):
             "agent_name": agent_name,
             "user_message_preview": _preview_str(user_message),
         }
-
-        session_logger.info("user_message", extra={"extra_fields": fields_main})
-        invocation_logger.info("user_message", extra={"extra_fields": fields_main})
+        msg= f"user_id: {invocation_context.user_id} has sent message {_preview_str(user_message)} to agent {agent_name} trace_id: {trace_id}"
+        session_logger.info(msg, extra={"extra_fields": fields_main})
+        invocation_logger.info(msg, extra={"extra_fields": fields_main})
 
         # DEBUG LOG: full payload (maybe redacted)
         session_debug_logger, invocation_debug_logger = (
@@ -898,6 +920,7 @@ class JsonLoggingPlugin(BasePlugin):
         if session_debug_logger and invocation_debug_logger:
             fields_debug = {
                 "event": "user_message_debug",
+                "trace_id": trace_id,
                 "user_id": invocation_context.user_id,
                 "session_id": session_id,
                 "invocation_id": invocation_id,
@@ -937,8 +960,8 @@ class JsonLoggingPlugin(BasePlugin):
 
         # Touch stats (idle detection)
         stats = self._touch_session_stats(ctx.agent.name, ctx.session.id)
-        # Count agent calls
         stats["total_agent_calls"] += 1
+        trace_id = stats.get("trace_id")
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
 
@@ -947,6 +970,7 @@ class JsonLoggingPlugin(BasePlugin):
 
         fields = {
             "event": "before_agent",
+            "trace_id": trace_id,
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
@@ -954,8 +978,12 @@ class JsonLoggingPlugin(BasePlugin):
             "agent_description": getattr(agent, "description", None),
         }
 
-        session_logger.info("before_agent", extra={"extra_fields": fields})
-        invocation_logger.info("before_agent", extra={"extra_fields": fields})
+        session_logger.info(
+            f"Before calling agent {agent.name} trace_id:{trace_id}", extra={"extra_fields": fields}
+        )
+        invocation_logger.info(
+            f"Before calling agent {agent.name} trace_id:{trace_id}", extra={"extra_fields": fields}
+        )
 
     # ---------------------------------------------------------
     # AFTER AGENT
@@ -979,6 +1007,7 @@ class JsonLoggingPlugin(BasePlugin):
 
         # Touch stats (idle detection)
         stats = self._touch_session_stats(ctx.agent.name, ctx.session.id)
+        trace_id = stats.get("trace_id")
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
 
@@ -993,6 +1022,7 @@ class JsonLoggingPlugin(BasePlugin):
 
         fields = {
             "event": "after_agent",
+            "trace_id": trace_id,
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
@@ -1000,8 +1030,12 @@ class JsonLoggingPlugin(BasePlugin):
             "agent_latency_ms": agent_latency_ms,
         }
 
-        session_logger.info("after_agent", extra={"extra_fields": fields})
-        invocation_logger.info("after_agent", extra={"extra_fields": fields})
+        session_logger.info(
+            f"After calling agent {agent.name} trace_id:{trace_id}", extra={"extra_fields": fields}
+        )
+        invocation_logger.info(
+            f"After calling agent {agent.name} trace_id:{trace_id}", extra={"extra_fields": fields}
+        )
 
     # ---------------------------------------------------------
     # BEFORE MODEL
@@ -1025,7 +1059,8 @@ class JsonLoggingPlugin(BasePlugin):
         ctx = callback_context._invocation_context
 
         # Touch stats (idle detection)
-        self._touch_session_stats(ctx.agent.name, ctx.session.id)
+        stats = self._touch_session_stats(ctx.agent.name, ctx.session.id)
+        trace_id = stats.get("trace_id")
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
 
@@ -1038,6 +1073,7 @@ class JsonLoggingPlugin(BasePlugin):
 
         fields = {
             "event": "before_model",
+            "trace_id": trace_id,
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
@@ -1047,8 +1083,14 @@ class JsonLoggingPlugin(BasePlugin):
             "top_p": getattr(config, "top_p", None) if config else None,
         }
 
-        session_logger.info("before_model", extra={"extra_fields": fields})
-        invocation_logger.info("before_model", extra={"extra_fields": fields})
+        session_logger.info(
+            f"Before calling model {llm_request.model} trace_id:{trace_id}",
+            extra={"extra_fields": fields},
+        )
+        invocation_logger.info(
+            f"Before calling model {llm_request.model} trace_id:{trace_id}",
+            extra={"extra_fields": fields},
+        )
 
     # ---------------------------------------------------------
     # AFTER MODEL  (NO COST HERE)
@@ -1078,8 +1120,8 @@ class JsonLoggingPlugin(BasePlugin):
 
         # Touch stats (idle detection) and get stats
         stats = self._touch_session_stats(ctx.agent.name, ctx.session.id)
-        # Count model call
         stats["total_model_calls"] += 1
+        trace_id = stats.get("trace_id")
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
 
@@ -1112,6 +1154,7 @@ class JsonLoggingPlugin(BasePlugin):
 
         fields = {
             "event": "after_model",
+            "trace_id": trace_id,
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
@@ -1125,8 +1168,10 @@ class JsonLoggingPlugin(BasePlugin):
             "interrupted": getattr(llm_response, "interrupted", None),
         }
 
-        session_logger.info("after_model", extra={"extra_fields": fields})
-        invocation_logger.info("after_model", extra={"extra_fields": fields})
+        session_logger.info(
+            f"After calling model {model_name} trace_id:{trace_id}", extra={"extra_fields": fields}
+        )
+        invocation_logger.info(f"After calling model {model_name} trace_id:{trace_id}", extra={"extra_fields": fields})
 
     # ---------------------------------------------------------
     # MODEL ERROR
@@ -1153,12 +1198,14 @@ class JsonLoggingPlugin(BasePlugin):
         ctx = callback_context._invocation_context
 
         # Touch stats (idle detection)
-        self._touch_session_stats(ctx.agent.name, ctx.session.id)
+        stats = self._touch_session_stats(ctx.agent.name, ctx.session.id)
+        trace_id = stats.get("trace_id")
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
 
         fields = {
             "event": "model_error",
+            "trace_id": trace_id,
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
@@ -1179,8 +1226,8 @@ class JsonLoggingPlugin(BasePlugin):
         invocation_error_logger = get_agent_invocation_error_logger(
             ctx.agent.name, ctx.invocation_id, self.level
         )
-        session_error_logger.error("model_error", extra={"extra_fields": fields})
-        invocation_error_logger.error("model_error", extra={"extra_fields": fields})
+        session_error_logger.error(f"model_error for agent {ctx.agent.name} traceid {trace_id}", extra={"extra_fields": fields})
+        invocation_error_logger.error(f"model_error for agent {ctx.agent.name} traceid {trace_id}", extra={"extra_fields": fields})
 
         return None
 
@@ -1207,7 +1254,8 @@ class JsonLoggingPlugin(BasePlugin):
         ctx = tool_context._invocation_context
 
         # Touch stats (idle detection)
-        self._touch_session_stats(ctx.agent.name, ctx.session.id)
+        stats = self._touch_session_stats(ctx.agent.name, ctx.session.id)
+        trace_id = stats.get("trace_id")
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
         session_debug_logger, invocation_debug_logger = (
@@ -1222,6 +1270,7 @@ class JsonLoggingPlugin(BasePlugin):
         # MAIN LOG: only keys / preview
         fields_main = {
             "event": "before_tool",
+            "trace_id": trace_id,
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
@@ -1229,26 +1278,30 @@ class JsonLoggingPlugin(BasePlugin):
             "tool_name": tool.name,
             "tool_arg_keys": list(tool_args.keys()),
         }
-
-        session_logger.info("before_tool", extra={"extra_fields": fields_main})
-        invocation_logger.info("before_tool", extra={"extra_fields": fields_main})
+        msg=f"Before calling tool {tool.name} from agent {ctx.agent.name} traceid {trace_id}"
+        session_logger.info(msg, extra={"extra_fields": fields_main})
+        invocation_logger.info(msg, extra={"extra_fields": fields_main})
 
         # DEBUG LOG: full args
         if session_debug_logger and invocation_debug_logger:
+            tool_input=self._maybe_redact(tool_args)
             fields_debug = {
                 "event": "before_tool_debug",
+                "trace_id": trace_id,
                 "user_id": ctx.user_id,
                 "session_id": ctx.session.id,
                 "invocation_id": ctx.invocation_id,
                 "agent_name": ctx.agent.name,
                 "tool_name": tool.name,
-                "tool_args_raw": self._maybe_redact(tool_args),
+                "tool_args_raw": tool_input,
             }
+            msg_new=f"Before calling tool {tool.name} from agent {ctx.agent.name} traceid {trace_id} request {tool_input}"
+
             session_debug_logger.debug(
-                "before_tool_debug", extra={"extra_fields": fields_debug}
+                msg_new, extra={"extra_fields": fields_debug}
             )
             invocation_debug_logger.debug(
-                "before_tool_debug", extra={"extra_fields": fields_debug}
+                msg_new, extra={"extra_fields": fields_debug}
             )
 
     async def after_tool_callback(
@@ -1273,8 +1326,8 @@ class JsonLoggingPlugin(BasePlugin):
 
         # Touch stats (idle detection) and get stats
         stats = self._touch_session_stats(ctx.agent.name, ctx.session.id)
-        # Count tool calls
         stats["total_tool_calls"] += 1
+        trace_id = stats.get("trace_id")
 
         session_logger, invocation_logger = self._session_invocation_loggers(ctx)
         session_debug_logger, invocation_debug_logger = (
@@ -1306,6 +1359,7 @@ class JsonLoggingPlugin(BasePlugin):
         # MAIN LOG: summary
         fields_main = {
             "event": "after_tool",
+            "trace_id": trace_id,
             "user_id": ctx.user_id,
             "session_id": ctx.session.id,
             "invocation_id": ctx.invocation_id,
@@ -1314,14 +1368,16 @@ class JsonLoggingPlugin(BasePlugin):
             "tool_latency_ms": tool_latency_ms,
             "tool_result_preview": _preview_str(result),
         }
+        msg=f"After calling tool {tool.name} from agent {ctx.agent.name} traceid {trace_id}"
 
-        session_logger.info("after_tool", extra={"extra_fields": fields_main})
-        invocation_logger.info("after_tool", extra={"extra_fields": fields_main})
+        session_logger.info(msg, extra={"extra_fields": fields_main})
+        invocation_logger.info(msg, extra={"extra_fields": fields_main})
 
         # DEBUG LOG: full result
         if session_debug_logger and invocation_debug_logger:
             fields_debug = {
                 "event": "after_tool_debug",
+                "trace_id": trace_id,
                 "user_id": ctx.user_id,
                 "session_id": ctx.session.id,
                 "invocation_id": ctx.invocation_id,
@@ -1379,6 +1435,7 @@ class JsonLoggingPlugin(BasePlugin):
         # SESSION STATE & LOGGERS
         # -------------------------------
         stats = self._touch_session_stats(agent_name, session_id)
+        trace_id = stats.get("trace_id")
         session_logger, invocation_logger = self._session_invocation_loggers(
             invocation_context
         )
@@ -1480,6 +1537,7 @@ class JsonLoggingPlugin(BasePlugin):
         # -------------------------------
         activity_block = {
             "event_name": event_name,
+            "trace_id": trace_id,
             "agent_name": agent_name,
             "session_id": session_id,
             "invocation_id": invocation_id,
@@ -1497,7 +1555,9 @@ class JsonLoggingPlugin(BasePlugin):
         action_tags = []
         if actions_meta:
             if actions_meta.get("transfer_to_agent"):
-                action_tags.append(f"transfer_to_agent={actions_meta['transfer_to_agent']}")
+                action_tags.append(
+                    f"transfer_to_agent={actions_meta['transfer_to_agent']}"
+                )
             if actions_meta.get("escalate"):
                 action_tags.append("escalate=True")
             if actions_meta.get("end_of_agent"):
@@ -1512,7 +1572,8 @@ class JsonLoggingPlugin(BasePlugin):
         actions_suffix = f" | actions: {', '.join(action_tags)}" if action_tags else ""
         human_activity = (
             f"Activity '{event_name}' for agent={agent_name}, "
-            f"session={session_id}, invocation={invocation_id}{actions_suffix}"
+            f"session={session_id}, invocation={invocation_id}, "
+            f"trace_id={trace_id}{actions_suffix}"
         )
 
         # -------------------------------
@@ -1542,6 +1603,7 @@ class JsonLoggingPlugin(BasePlugin):
         fields = {
             "event": "turn_token_usage",
             "usage_scope": "turn",
+            "trace_id": trace_id,
 
             # structured activity meta
             "activity": activity_block,
@@ -1573,8 +1635,9 @@ class JsonLoggingPlugin(BasePlugin):
         # -------------------------------
         # WRITE STRUCTURED LOGS
         # -------------------------------
-        session_logger.info("turn_token_usage", extra={"extra_fields": fields})
-        invocation_logger.info("turn_token_usage", extra={"extra_fields": fields})
+        msg=f"token_usage for agent {agent_name} traceid {trace_id} sessionid {session_id}"
+        session_logger.info(msg, extra={"extra_fields": fields})
+        invocation_logger.info(msg, extra={"extra_fields": fields})
 
         # -------------------------------
         # COST LOG SEPARATE FILE
@@ -1584,7 +1647,7 @@ class JsonLoggingPlugin(BasePlugin):
             agent_name, invocation_id
         )
 
-        session_cost_logger.info("turn_cost", extra={"extra_fields": fields})
-        invocation_cost_logger.info("turn_cost", extra={"extra_fields": fields})
+        session_cost_logger.info(msg, extra={"extra_fields": fields})
+        invocation_cost_logger.info(msg, extra={"extra_fields": fields})
 
         return None
